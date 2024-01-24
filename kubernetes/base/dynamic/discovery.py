@@ -19,9 +19,8 @@ import logging
 import hashlib
 import tempfile
 from functools import partial
-from collections import defaultdict
 from abc import abstractmethod, abstractproperty
-
+from threading import Lock
 from urllib3.exceptions import ProtocolError, MaxRetryError
 
 from kubernetes import __version__
@@ -51,6 +50,7 @@ class Discoverer(object):
             # usedforsecurity is only supported in 3.9+
             default_cachefile_name = 'osrcp-{0}.json'.format(hashlib.md5(default_cache_id).hexdigest())
         self.__cache_file = cache_file or os.path.join(tempfile.gettempdir(), default_cachefile_name)
+        self.__cache_lock = Lock()
         self.__init_cache()
 
     def __init_cache(self, refresh=False):
@@ -59,8 +59,9 @@ class Discoverer(object):
             refresh = True
         else:
             try:
-                with open(self.__cache_file, 'r') as f:
-                    self._cache = json.load(f, cls=partial(CacheDecoder, self.client))
+                with self.__cache_lock:
+                    with open(self.__cache_file, 'r') as f:
+                        self._cache = json.load(f, cls=partial(CacheDecoder, self.client))
                 if self._cache.get('library_version') != __version__:
                     # Version mismatch, need to refresh cache
                     self.invalidate_cache()
@@ -74,8 +75,9 @@ class Discoverer(object):
 
     def _write_cache(self):
         try:
-            with open(self.__cache_file, 'w') as f:
-                json.dump(self._cache, f, cls=CacheEncoder)
+            with self.__cache_lock:
+                with open(self.__cache_file, 'w') as f:
+                    json.dump(self._cache, f, cls=CacheEncoder)
         except Exception:
             # Failing to write the cache isn't a big enough error to crash on
             pass
@@ -113,7 +115,7 @@ class Discoverer(object):
 
     def parse_api_groups(self, request_resources=False, update=False):
         """ Discovers all API groups present in the cluster """
-        if not self._cache.get('resources') or update:
+        if 'resources' not in  self._cache or update:
             self._cache['resources'] = self._cache.get('resources', {})
             groups_response = self.client.request('GET', '/{}'.format(DISCOVERY_PREFIX)).groups
 
@@ -133,13 +135,13 @@ class Discoverer(object):
             self._cache['resources'].update(groups)
             self._write_cache()
 
-        return self._cache['resources']
+        return self._cache.get('resources', {})
 
     def _load_server_info(self):
         def just_json(_, serialized):
             return serialized
 
-        if not self._cache.get('version'):
+        if 'version' not in self._cache:
             try:
                 self._cache['version'] = {
                     'kubernetes': self.client.request('get', '/version', serializer=just_json)
@@ -153,12 +155,12 @@ class Discoverer(object):
                 else:
                     raise
 
-        self.__version = self._cache['version']
+        self.__version = self._cache.get('version')
 
     def get_resources_for_api_version(self, prefix, group, version, preferred):
         """ returns a dictionary of resources associated with provided (prefix, group, version)"""
 
-        resources = defaultdict(list)
+        resources = {}
         subresources = {}
 
         path = '/'.join(filter(None, [prefix, group, version]))
@@ -173,7 +175,7 @@ class Discoverer(object):
             resource, name = subresource['name'].split('/', 1)
             if not subresources.get(resource):
                 subresources[resource] = {}
-            subresources[resource][name] = subresource
+            subresources.setdefault(resource, {})[name] = subresource
 
         for resource in resources_raw:
             # Prevent duplicate keys
@@ -189,10 +191,10 @@ class Discoverer(object):
                 subresources=subresources.get(resource['name']),
                 **resource
             )
-            resources[resource['kind']].append(resourceobj)
+            resources.setdefault(resource['kind'], []).append(resourceobj)
 
             resource_list = ResourceList(self.client, group=group, api_version=version, base_kind=resource['kind'])
-            resources[resource_list.kind].append(resource_list)
+            resources.setdefault(resource_list.kind, []).append(resource_list)
         return resources
 
     def get(self, **kwargs):
@@ -271,7 +273,7 @@ class LazyDiscoverer(Discoverer):
                     except NotFoundError:
                         raise ResourceNotFoundError
 
-                    self._cache['resources'][prefix][group][version] = resourcePart
+                    self.__update_cache_resource(prefix, group, version, resourcePart)
                     self.__update_cache = True
                 return self.__search(parts[1:], resourcePart.resources, reqParams)
             elif isinstance(resourcePart, dict):
@@ -301,6 +303,9 @@ class LazyDiscoverer(Discoverer):
         items = [prefix, group, api_version, kind, kwargs]
         return list(map(lambda x: x or '*', items))
 
+    def __update_cache_resource(self, prefix, group, version, resourcePart):
+        self._cache.setdefault("resources",{}).setdefault(prefix, {}).setdefault(group, {})[version] = resourcePart
+        
     def __iter__(self):
         for prefix, groups in self.__resources.items():
             for group, versions in groups.items():
@@ -309,7 +314,8 @@ class LazyDiscoverer(Discoverer):
                     if not rg.resources:
                         rg.resources = self.get_resources_for_api_version(
                             prefix, group, version, rg.preferred)
-                        self._cache['resources'][prefix][group][version] = rg
+
+                        self.__update_cache_resource(prefix, group, version, rg)
                         self.__update_cache = True
                     for _, resource in six.iteritems(rg.resources):
                         yield resource
